@@ -1,0 +1,372 @@
+#include <stdio.h>
+#include <string.h>
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"         
+#include "driver/gpio.h"        
+#include "driver/adc.h"         
+
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+static const char *TAG = "AppMedic_SPH0645_DSP";
+
+// ----------- CONFIGURACIÓN I2S (SPH0645) -----------
+#define I2S_PORT         I2S_NUM_0
+#define SAMPLE_RATE      16000    
+#define BUFFER_LEN       256      
+#define DOWNSAMPLE_FACTOR 4       
+
+#define I2S_BCK_IO       26
+#define I2S_WS_IO        25
+#define I2S_DI_IO        33
+
+int32_t i2s_buffer[BUFFER_LEN];
+
+// ----------- CONFIGURACIÓN DE LEDS Y ADC -----------
+#define LED_VERDE_PIN    13     
+#define LED_ROJO_PIN     12     
+#define LED_AZUL_PIN     14     
+#define BATTERY_ADC_CH   ADC1_CHANNEL_4 
+#define ADC_THRESHOLD_LOW  1600
+
+// ----------- VARIABLES GLOBALES PARA DSP -----------
+float lpf_y = 0.0f;
+float hpf_x_prev = 0.0f;
+float hpf_y_prev = 0.0f;
+
+// ----------- VARIABLES BLE -----------
+static const ble_uuid16_t SVC_UUID_AA00_16 = BLE_UUID16_INIT(0xAA00);
+
+#define BLE_UUID_BASE_VAL(uuid16) \
+    0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, ((uuid16) & 0xFF), (((uuid16) >> 8) & 0xFF), 0x00, 0x00
+
+static const ble_uuid128_t CHR_UUID_AUDIO    = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA01));
+static const ble_uuid128_t CHR_UUID_DEVINFO  = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA02)); 
+static const ble_uuid128_t CHR_UUID_COMMAND  = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA03));
+static const ble_uuid128_t CHR_UUID_STATUS   = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA04)); 
+
+uint16_t audio_handle, devinfo_handle, command_handle, status_handle;
+uint16_t conn_handle = 0xFFFF;
+uint16_t audio_seq_num = 0;
+
+char device_name[14] = "APPMEDIC-XXXX"; 
+char devinfo_json[180];        
+uint8_t device_status = 0x05;           
+
+static int gap_event_handler(struct ble_gap_event *event, void *arg);
+static void start_advertising(void);
+
+// =======================================================================
+// INICIALIZACIÓN DE HARDWARE Y MONITORES
+// =======================================================================
+void init_hardware_monitors(void) {
+    gpio_reset_pin(LED_VERDE_PIN);
+    gpio_set_direction(LED_VERDE_PIN, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(LED_ROJO_PIN);
+    gpio_set_direction(LED_ROJO_PIN, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(LED_AZUL_PIN);
+    gpio_set_direction(LED_AZUL_PIN, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(LED_VERDE_PIN, 1);
+    gpio_set_level(LED_ROJO_PIN, 1);
+    gpio_set_level(LED_AZUL_PIN, 1);
+
+    adc1_config_width(ADC_WIDTH_BIT_12); 
+    adc1_config_channel_atten(BATTERY_ADC_CH, ADC_ATTEN_DB_12); 
+    
+    ESP_LOGI(TAG, "Monitores de hardware (LEDs y ADC) inicializados.");
+}
+
+void battery_monitor_task(void *pv) {
+    while(1) {
+        int adc_raw = adc1_get_raw(BATTERY_ADC_CH);
+        if (adc_raw < ADC_THRESHOLD_LOW) {
+            gpio_set_level(LED_VERDE_PIN, 1);
+            gpio_set_level(LED_ROJO_PIN, 0);
+        } else {
+            gpio_set_level(LED_VERDE_PIN, 0);
+            gpio_set_level(LED_ROJO_PIN, 1);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+void i2s_init(void) {
+    i2s_config_t i2s_config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,     
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,     
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256, // Ajustado a 256 para mayor estabilidad con el DSP                                
+        .use_apll = false
+    };
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK_IO,
+        .ws_io_num = I2S_WS_IO,
+        .data_out_num = -1,
+        .data_in_num = I2S_DI_IO
+    };
+    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_PORT, &pin_config);
+    i2s_zero_dma_buffer(I2S_PORT);
+}
+
+// =======================================================================
+// FUNCIONES DSP (Procesamiento de Señal Digital)
+// =======================================================================
+
+// 1. Filtro de Mediana
+int16_t aplicar_filtro_mediana_5(int16_t nueva_muestra) {
+    static int16_t v[5] = {0};
+    int16_t temp[5];
+    for(int i = 4; i > 0; i--) v[i] = v[i-1];
+    v[0] = nueva_muestra;
+    for(int i = 0; i < 5; i++) temp[i] = v[i];
+    for(int i = 1; i < 5; i++) {
+        int16_t key = temp[i];
+        int j = i - 1;
+        while(j >= 0 && temp[j] > key) {
+            temp[j+1] = temp[j];
+            j--;
+        }
+        temp[j+1] = key;
+    }
+    return temp[2]; 
+}
+
+// 2. Slew Rate Limiter (Limita velocidad de cambio)
+int16_t aplicar_limitador_velocidad(int16_t nueva_muestra) {
+    static int16_t muestra_anterior = 0;
+    const int32_t MAX_DELTA = 1000; 
+    int32_t delta = (int32_t)nueva_muestra - (int32_t)muestra_anterior;
+    if (delta > MAX_DELTA) nueva_muestra = muestra_anterior + MAX_DELTA;
+    else if (delta < -MAX_DELTA) nueva_muestra = muestra_anterior - MAX_DELTA;
+    muestra_anterior = nueva_muestra;
+    return nueva_muestra;
+}
+
+// 3. Filtro Anti-aire y Anti-retumbo
+int16_t aplicar_filtro_anti_aire(int16_t muestra) {
+    float x = (float)muestra;
+    lpf_y = 0.10f * x + 0.90f * lpf_y;
+    float hpf_y = lpf_y - hpf_x_prev + 0.92f * hpf_y_prev; 
+    hpf_x_prev = lpf_y;
+    hpf_y_prev = hpf_y;
+    return (int16_t)hpf_y;
+}
+
+// 4. Soft Clipper
+int16_t aplicar_limitador_suave(int16_t muestra) {
+    if (muestra > 18000) return 18000 + ((muestra - 18000) / 2);
+    else if (muestra < -18000) return -18000 + ((muestra + 18000) / 2);
+    return muestra;
+}
+
+// =======================================================================
+// TAREA PRINCIPAL DE AUDIO Y BLE
+// =======================================================================
+void audio_stream_task(void *pv) {
+    uint8_t packet_buffer[244];
+    int16_t *audio_samples = (int16_t *)&packet_buffer[2]; 
+    
+    size_t bytes_read;
+    int sample_index = 0;
+    int32_t acumulador = 0; 
+    int contador_muestras = 0;
+
+    int muestras_ignoradas = 0;
+    const int MUESTRAS_A_IGNORAR = 6000; 
+
+    ESP_LOGI(TAG, "Streaming BLE iniciado. DSP Master Activo.");
+
+    while(1) {
+        esp_err_t ret = i2s_read(I2S_PORT, i2s_buffer, sizeof(i2s_buffer), &bytes_read, portMAX_DELAY);
+        
+        if (ret == ESP_OK && bytes_read > 0) {
+            int samples_read = bytes_read / sizeof(int32_t);
+            
+            for (int i = 0; i < samples_read; i++) {
+                int16_t clean_sample = (int16_t)(i2s_buffer[i] >> 12); 
+
+                acumulador += clean_sample;
+                contador_muestras++;
+
+                // Decimación a 4kHz
+                if (contador_muestras >= DOWNSAMPLE_FACTOR) {
+                    int16_t muestra_4khz = (int16_t)(acumulador / DOWNSAMPLE_FACTOR);
+                    acumulador = 0;
+                    contador_muestras = 0;
+
+                    // Ignorar las primeras muestras para estabilizar el micro
+                    if (muestras_ignoradas < MUESTRAS_A_IGNORAR) {
+                        muestras_ignoradas++;
+                        continue; 
+                    }
+
+                    // --- CADENA DE PROCESAMIENTO DIGITAL (DSP) ---
+                    int16_t st1 = aplicar_filtro_mediana_5(muestra_4khz);
+                    int16_t st2 = aplicar_limitador_velocidad(st1);
+                    int16_t st3 = aplicar_filtro_anti_aire(st2);
+                    int16_t final_sample = aplicar_limitador_suave(st3);
+
+                    audio_samples[sample_index] = final_sample;
+                    sample_index++;
+
+                    // Al completar 121 muestras enviamos vía BLE
+                    if (sample_index >= 121) {
+                        packet_buffer[0] = (uint8_t)((audio_seq_num >> 8) & 0xFF);
+                        packet_buffer[1] = (uint8_t)(audio_seq_num & 0xFF);
+                        
+                        if (conn_handle != 0xFFFF) {
+                            struct os_mbuf *om = ble_hs_mbuf_from_flat(packet_buffer, sizeof(packet_buffer));
+                            if (om) {
+                                int rc = ble_gattc_notify_custom(conn_handle, audio_handle, om);
+                                if (rc == 0) audio_seq_num++;
+                            }
+                        }
+                        sample_index = 0; 
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =======================================================================
+// CONFIGURACIÓN BLE (NimBLE)
+// =======================================================================
+void update_status_bitfield(void) {
+    device_status = 0x05; 
+    if (conn_handle != 0xFFFF) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(&device_status, 1);
+        if (om) ble_gattc_notify_custom(conn_handle, status_handle, om);
+    }
+}
+
+static int gatt_access_cb(uint16_t c_h, uint16_t a_h, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (a_h == devinfo_handle && ctxt->op == BLE_ATT_ACCESS_OP_READ) {
+        return os_mbuf_append(ctxt->om, devinfo_json, strlen(devinfo_json)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (a_h == command_handle && ctxt->op == BLE_ATT_ACCESS_OP_WRITE) {
+        if (ctxt->om->om_len > 0) {
+            uint8_t command;
+            os_mbuf_copydata(ctxt->om, 0, 1, &command);
+            ESP_LOGI(TAG, "Comando recibido: 0x%02X", command);
+            if (command == 0xFF) esp_restart();
+        }
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = (ble_uuid_t *)&SVC_UUID_AA00_16, 
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {.uuid = &CHR_UUID_AUDIO.u, .val_handle = &audio_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_NOTIFY},
+            {.uuid = &CHR_UUID_DEVINFO.u, .val_handle = &devinfo_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_READ},
+            {.uuid = &CHR_UUID_COMMAND.u, .val_handle = &command_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_WRITE},
+            {.uuid = &CHR_UUID_STATUS.u, .val_handle = &status_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY},
+            {0} 
+        }
+    },
+    {0} 
+};
+
+static void start_advertising(void) {
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)device_name;
+    fields.name_len = strlen(device_name);
+    fields.name_is_complete = 1;
+    fields.uuids16 = (ble_uuid16_t[]){ SVC_UUID_AA00_16 };
+    fields.num_uuids16 = 1;
+    fields.uuids16_is_complete = 1;
+
+    ble_gap_adv_set_fields(&fields);
+    struct ble_gap_adv_params adv_p = { .conn_mode = BLE_GAP_CONN_MODE_UND, .disc_mode = BLE_GAP_DISC_MODE_GEN };
+    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_p, gap_event_handler, NULL);
+    ESP_LOGI(TAG, "Publicidad lista: %s", device_name);
+    
+    gpio_set_level(LED_AZUL_PIN, 0); 
+}
+
+static int gap_event_handler(struct ble_gap_event *event, void *arg) {
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                conn_handle = event->connect.conn_handle;
+                ESP_LOGI(TAG, "¡Conectado!");
+                gpio_set_level(LED_AZUL_PIN, 1);
+                audio_seq_num = 0;
+                update_status_bitfield(); 
+            } else {
+                start_advertising();
+            }
+            break;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            update_status_bitfield();
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            conn_handle = 0xFFFF; 
+            start_advertising(); 
+            break;
+    }
+    return 0;
+}
+
+void on_stack_sync(void) {
+    ble_hs_id_infer_auto(0, &(uint8_t){0});
+    ble_svc_gap_device_name_set(device_name);
+    start_advertising();
+}
+
+void nimble_host_task(void *param) { 
+    nimble_port_run();
+}
+
+void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    init_hardware_monitors();
+    
+    xTaskCreatePinnedToCore(battery_monitor_task, "battery_monitor_task", 4096, NULL, 4, NULL, 0);
+
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA); 
+    snprintf(device_name, sizeof(device_name), "APPMEDIC-%02X%02X", mac[4], mac[5]); 
+
+    i2s_init();
+
+    snprintf(devinfo_json, sizeof(devinfo_json),
+             "{\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\",\"name\":\"%s\",\"model\":\"STETH-V1\",\"firmware\":\"1.0.0\"}",
+             device_name);
+
+    nimble_port_init();
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_gatts_count_cfg(gatt_svcs);
+    ble_gatts_add_svcs(gatt_svcs);
+
+    ble_hs_cfg.sync_cb = on_stack_sync;
+
+    xTaskCreatePinnedToCore(audio_stream_task, "audio_stream_task", 8192, NULL, 8, NULL, 0);
+    
+    nimble_port_freertos_init(nimble_host_task);
+}
