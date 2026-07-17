@@ -8,6 +8,7 @@
 #include "driver/i2s.h"         
 #include "driver/gpio.h"        
 #include "driver/adc.h"         
+#include "driver/ledc.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -27,14 +28,28 @@ static const char *TAG = "AppMedic_SPH0645_DSP";
 #define I2S_WS_IO        25
 #define I2S_DI_IO        33
 
+// ----------- CONFIGURACIÓN DE PWM (LEDC) -----------
+#define LEDC_MODE               LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES           LEDC_TIMER_8_BIT 
+#define LEDC_FREQUENCY          5000             
+
+#define CANAL_LED_VERDE         LEDC_CHANNEL_0
+#define CANAL_LED_ROJO          LEDC_CHANNEL_1
+#define CANAL_LED_AZUL          LEDC_CHANNEL_2
+
+// PRUEBA DE LÓGICA NORMAL (Si no funciona, abajo te dejo los otros valores)
+#define LED_APAGADO             0    // 0% de voltaje (GND) = Totalmente apagado
+#define LED_BRILLO_TENUE        38   // 25=10%, 51=20%, 76=30%, 102=40%, 127=50%, 153=60%, 178=70%, 204=80%, 229=90%, 255=100%
+
 int32_t i2s_buffer[BUFFER_LEN];
 
 // ----------- CONFIGURACIÓN DE LEDS Y ADC -----------
 #define LED_VERDE_PIN    13     
 #define LED_ROJO_PIN     12     
-#define LED_AZUL_PIN     14     
-#define BATTERY_ADC_CH   ADC1_CHANNEL_4 
-#define ADC_THRESHOLD_LOW  1600
+#define LED_AZUL_PIN     18     
+#define BATTERY_ADC_CH   ADC1_CHANNEL_4 //GPIO 32
+//#define ADC_THRESHOLD_LOW  1600
+#define ADC_THRESHOLD_LOW  2150
 
 // ----------- VARIABLES GLOBALES PARA DSP -----------
 float lpf_y = 0.0f;
@@ -68,32 +83,51 @@ static void start_advertising(void);
 // INICIALIZACIÓN DE HARDWARE Y MONITORES
 // =======================================================================
 void init_hardware_monitors(void) {
-    gpio_reset_pin(LED_VERDE_PIN);
-    gpio_set_direction(LED_VERDE_PIN, GPIO_MODE_OUTPUT);
-    gpio_reset_pin(LED_ROJO_PIN);
-    gpio_set_direction(LED_ROJO_PIN, GPIO_MODE_OUTPUT);
-    gpio_reset_pin(LED_AZUL_PIN);
-    gpio_set_direction(LED_AZUL_PIN, GPIO_MODE_OUTPUT);
+    // 1. Configurar el Temporizador por Hardware para el PWM
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .freq_hz          = LEDC_FREQUENCY,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
 
-    gpio_set_level(LED_VERDE_PIN, 1);
-    gpio_set_level(LED_ROJO_PIN, 1);
-    gpio_set_level(LED_AZUL_PIN, 1);
+    // 2. Vincular cada LED a un canal del Temporizador (Inician apagados: Duty 255)
+    ledc_channel_config_t ledc_channel[3] = {
+        { .channel = CANAL_LED_VERDE, .gpio_num = LED_VERDE_PIN, .speed_mode = LEDC_MODE, .timer_sel = LEDC_TIMER_0, .duty = LED_APAGADO, .hpoint = 0 },
+        { .channel = CANAL_LED_ROJO,  .gpio_num = LED_ROJO_PIN,  .speed_mode = LEDC_MODE, .timer_sel = LEDC_TIMER_0, .duty = LED_APAGADO, .hpoint = 0 },
+        { .channel = CANAL_LED_AZUL,  .gpio_num = LED_AZUL_PIN,  .speed_mode = LEDC_MODE, .timer_sel = LEDC_TIMER_0, .duty = LED_APAGADO, .hpoint = 0 }
+    };
+    for (int i = 0; i < 3; i++) {
+        ledc_channel_config(&ledc_channel[i]);
+    }
 
+    // 3. Configurar el ADC1 para la Batería (sin cambios)
     adc1_config_width(ADC_WIDTH_BIT_12); 
     adc1_config_channel_atten(BATTERY_ADC_CH, ADC_ATTEN_DB_12); 
     
-    ESP_LOGI(TAG, "Monitores de hardware (LEDs y ADC) inicializados.");
+    ESP_LOGI(TAG, "Monitores PWM (30% Brillo) y ADC inicializados.");
+}
+
+// Función auxiliar para facilitar el control de los LEDs en el código
+void set_led_state(ledc_channel_t channel, bool turn_on) {
+    uint32_t duty = turn_on ? LED_BRILLO_TENUE : LED_APAGADO;
+    ledc_set_duty(LEDC_MODE, channel, duty);
+    ledc_update_duty(LEDC_MODE, channel);
 }
 
 void battery_monitor_task(void *pv) {
     while(1) {
         int adc_raw = adc1_get_raw(BATTERY_ADC_CH);
         if (adc_raw < ADC_THRESHOLD_LOW) {
-            gpio_set_level(LED_VERDE_PIN, 1);
-            gpio_set_level(LED_ROJO_PIN, 0);
+            // Batería Baja: Enciende Rojo al 30%, Apaga Verde
+            set_led_state(CANAL_LED_VERDE, false);
+            set_led_state(CANAL_LED_ROJO, true);
         } else {
-            gpio_set_level(LED_VERDE_PIN, 0);
-            gpio_set_level(LED_ROJO_PIN, 1);
+            // Batería OK: Enciende Verde al 30%, Apaga Rojo
+            set_led_state(CANAL_LED_VERDE, true);
+            set_led_state(CANAL_LED_ROJO, false);
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
@@ -301,6 +335,11 @@ static void start_advertising(void) {
     ESP_LOGI(TAG, "Publicidad lista: %s", device_name);
     
     gpio_set_level(LED_AZUL_PIN, 0); 
+    set_led_state(CANAL_LED_AZUL, true);
+
+    // Mandamos el brillo al 100% (255) solo para probar si el azul está vivo
+    //ledc_set_duty(LEDC_MODE, CANAL_LED_AZUL, 255); 
+    //ledc_update_duty(LEDC_MODE, CANAL_LED_AZUL);
 }
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg) {
@@ -309,7 +348,13 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             if (event->connect.status == 0) {
                 conn_handle = event->connect.conn_handle;
                 ESP_LOGI(TAG, "¡Conectado!");
-                gpio_set_level(LED_AZUL_PIN, 1);
+                
+                // AQUÍ: Cambiamos a true para que se quede encendido al conectarse
+                set_led_state(CANAL_LED_AZUL, false); // Apagamos el azul al conectarse 
+                // Mantenemos el azul encendido a tope para confirmarlo
+                //ledc_set_duty(LEDC_MODE, CANAL_LED_AZUL, 255); 
+                //ledc_update_duty(LEDC_MODE, CANAL_LED_AZUL);
+                
                 audio_seq_num = 0;
                 update_status_bitfield(); 
             } else {
