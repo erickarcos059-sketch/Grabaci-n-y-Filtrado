@@ -1,0 +1,583 @@
+/*
+ * AppMedic - Estetoscopio ESP32 (SPH0645 I2S + NimBLE)  ·  main.c
+ * -----------------------------------------------------------------------------
+ * Firmware listo para flashear (ESP-IDF).   Build:  idf.py build flash monitor
+ * (dejar en main/main.c del proyecto ESP-IDF; entry point = app_main).
+ *
+ * 2026-07-17 - Optimizacion CARDIACA (solo corazon por ahora):
+ *   `aplicar_filtro_anti_aire` ensanchado de ~53-67 Hz a ~26-150 Hz (la banda
+ *   real del corazon). Recupera +4..+6 dB de senal cardiaca que el dispositivo
+ *   botaba (67-150 Hz preservada 39% -> 75%). Los coeficientes ANTERIORES
+ *   quedaron comentados inline para A/B inmediato. Sin cambios en el resto.
+ *   Analisis (numpy/scipy) + protocolo de validacion en device:
+ *   heart-firmware-changes.md  (+ heart_analysis.png / .py).
+ *
+ * Contrato BLE (sin cambios): svc 0xAA00 · 0xAA01 audio NOTIFY (2B seq BE +
+ *   121 muestras i16 LE @ 4 kHz) · 0xAA02 devinfo · 0xAA03 comando (solo
+ *   0xFF = reset) · 0xAA04 status.
+ */
+#include <stdio.h>
+#include <string.h>
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"         
+#include "driver/gpio.h"        
+#include "driver/adc.h"         
+#include "driver/ledc.h"
+
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_att.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+static const char *TAG = "AppMedic_SPH0645_DSP";
+
+// ----------- CONFIGURACIÓN I2S (SPH0645) -----------
+#define I2S_PORT         I2S_NUM_0
+#define SAMPLE_RATE      16000    
+#define BUFFER_LEN       256      
+#define DOWNSAMPLE_FACTOR 4       
+
+#define I2S_BCK_IO       26
+#define I2S_WS_IO        25
+#define I2S_DI_IO        33
+
+// ----------- CONFIGURACIÓN DE PWM (LEDC) -----------
+#define LEDC_MODE               LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES           LEDC_TIMER_8_BIT 
+#define LEDC_FREQUENCY          5000             
+
+#define CANAL_LED_VERDE         LEDC_CHANNEL_0
+#define CANAL_LED_ROJO          LEDC_CHANNEL_1
+#define CANAL_LED_AZUL          LEDC_CHANNEL_2
+
+// PRUEBA DE LÓGICA NORMAL (Si no funciona, abajo te dejo los otros valores)
+#define LED_APAGADO             0    // 0% de voltaje (GND) = Totalmente apagado
+#define LED_BRILLO_TENUE        38   // 25=10%, 51=20%, 76=30%, 102=40%, 127=50%, 153=60%, 178=70%, 204=80%, 229=90%, 255=100%
+
+int32_t i2s_buffer[BUFFER_LEN];
+
+// ----------- CONFIGURACIÓN DE LEDS Y ADC -----------
+#define LED_VERDE_PIN    13     
+#define LED_ROJO_PIN     12     
+#define LED_AZUL_PIN     18     
+#define BATTERY_ADC_CH   ADC1_CHANNEL_4 //GPIO 32
+//#define ADC_THRESHOLD_LOW  1600
+#define ADC_THRESHOLD_LOW  2150
+
+// ----------- VARIABLES GLOBALES PARA DSP (ACTUALIZADAS) -----------
+// Memorias para el Filtro Pasa Altas (HPF) - Se mantiene igual (30 Hz)
+float hpf_x1 = 0.0f, hpf_x2 = 0.0f;
+float hpf_y1 = 0.0f, hpf_y2 = 0.0f;
+
+// Memorias para el Filtro Pasa Bajas (Etapa 1)
+float lpf_x1 = 0.0f, lpf_x2 = 0.0f;
+float lpf_y1 = 0.0f, lpf_y2 = 0.0f;
+
+// Memorias para el Filtro Pasa Bajas (Etapa 2 - El muro doble)
+float lpf2_x1 = 0.0f, lpf2_x2 = 0.0f;
+float lpf2_y1 = 0.0f, lpf2_y2 = 0.0f;
+
+// ----------- COEFICIENTES DEL FILTRO BIQUAD (Fs = 4000 Hz) -----------
+// Etapa 1: HPF a 30 Hz (Corta el retumbo subgrave)
+const float HPF_B0 =  0.9672f;
+const float HPF_B1 = -1.9344f;
+const float HPF_B2 =  0.9672f;
+const float HPF_A1 = -1.9333f;
+const float HPF_A2 =  0.9355f;
+
+// Etapas 2 y 3: LPF ajustado a 110 Hz (Aisla el bajo de la música)
+const float LPF_B0 =  0.0066f;
+const float LPF_B1 =  0.0133f;
+const float LPF_B2 =  0.0066f;
+const float LPF_A1 = -1.7566f;
+const float LPF_A2 =  0.7832f;
+
+// ----------- VARIABLES BLE -----------
+static const ble_uuid16_t SVC_UUID_AA00_16 = BLE_UUID16_INIT(0xAA00);
+
+#define BLE_UUID_BASE_VAL(uuid16) \
+    0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80, \
+    0x00, 0x10, 0x00, 0x00, ((uuid16) & 0xFF), (((uuid16) >> 8) & 0xFF), 0x00, 0x00
+
+static const ble_uuid128_t CHR_UUID_AUDIO    = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA01));
+static const ble_uuid128_t CHR_UUID_DEVINFO  = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA02)); 
+static const ble_uuid128_t CHR_UUID_COMMAND  = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA03));
+static const ble_uuid128_t CHR_UUID_STATUS   = BLE_UUID128_INIT(BLE_UUID_BASE_VAL(0xAA04)); 
+
+uint16_t audio_handle, devinfo_handle, command_handle, status_handle;
+uint16_t conn_handle = 0xFFFF;
+uint16_t audio_seq_num = 0;
+// Payload de audio dimensionado al MTU ATT negociado por conexion (iOS ~185,
+// Android 247): bytes = min(((MTU-3-2) redondeado a par), 242). Default 242
+// (121 muestras). Se recalcula en connect + evento MTU. Fix iOS
+// disconnect-on-send -> ver docs/estetoscopio-firmware-mtu.md.
+volatile uint16_t g_audio_bytes = 242;
+// Gate de streaming: el audio SOLO se emite tras START_RECORDING (0x01) y para
+// con STOP (0x02). En continuo, el flood de notificaciones congestiona la capa
+// ATT en iOS y hace fallar el writeCharacteristic de los comandos (ATT Unlikely,
+// apple-code 14) -> la grabacion nunca arranca. Con el gate el link queda libre
+// para los comandos y START inicia de verdad.
+volatile bool g_streaming = false;
+
+char device_name[14] = "APPMEDIC-XXXX";
+char devinfo_json[180];
+// Bitfield 0xAA04: bit0 isConnected, bit1 isWarmingUp, bit2 isRecording.
+// Se actualiza por estado: connect=0x01, warm-up=0x03, grabando=0x05, stop=0x01,
+// disconnect=0x00. Antes era 0x05 FIJO -> la app veia isRecording=1 al conectar
+// y "grababa sola" tras el sync. Ahora refleja el estado real.
+uint8_t device_status = 0x00;
+// Warm-up por-grabacion (cuenta regresiva en muestras 4kHz). -1 = inactivo.
+// Al llegar a 0: enciende streaming + notifica isWarmingUp=0 -> la app (que fijo
+// isWarmingUp=true optimista al tocar Grabar) ve la transicion y arranca sus 10s
+// exactos, sin esperar su fallback de 6s (grababa 16s en vez de 10s).
+volatile int32_t g_ready_countdown = -1;
+
+static int gap_event_handler(struct ble_gap_event *event, void *arg);
+static void start_advertising(void);
+void update_status_bitfield(void);   // usada por el audio-task antes de su definicion
+
+// =======================================================================
+// INICIALIZACIÓN DE HARDWARE Y MONITORES
+// =======================================================================
+void init_hardware_monitors(void) {
+    // 1. Configurar el Temporizador por Hardware para el PWM
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .freq_hz          = LEDC_FREQUENCY,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    // 2. Vincular cada LED a un canal del Temporizador (Inician apagados: Duty 255)
+    ledc_channel_config_t ledc_channel[3] = {
+        { .channel = CANAL_LED_VERDE, .gpio_num = LED_VERDE_PIN, .speed_mode = LEDC_MODE, .timer_sel = LEDC_TIMER_0, .duty = LED_APAGADO, .hpoint = 0 },
+        { .channel = CANAL_LED_ROJO,  .gpio_num = LED_ROJO_PIN,  .speed_mode = LEDC_MODE, .timer_sel = LEDC_TIMER_0, .duty = LED_APAGADO, .hpoint = 0 },
+        { .channel = CANAL_LED_AZUL,  .gpio_num = LED_AZUL_PIN,  .speed_mode = LEDC_MODE, .timer_sel = LEDC_TIMER_0, .duty = LED_APAGADO, .hpoint = 0 }
+    };
+    for (int i = 0; i < 3; i++) {
+        ledc_channel_config(&ledc_channel[i]);
+    }
+
+    // 3. Configurar el ADC1 para la Batería (sin cambios)
+    adc1_config_width(ADC_WIDTH_BIT_12); 
+    adc1_config_channel_atten(BATTERY_ADC_CH, ADC_ATTEN_DB_12); 
+    
+    ESP_LOGI(TAG, "Monitores PWM (30% Brillo) y ADC inicializados.");
+}
+
+// Función auxiliar para facilitar el control de los LEDs en el código
+void set_led_state(ledc_channel_t channel, bool turn_on) {
+    uint32_t duty = turn_on ? LED_BRILLO_TENUE : LED_APAGADO;
+    ledc_set_duty(LEDC_MODE, channel, duty);
+    ledc_update_duty(LEDC_MODE, channel);
+}
+
+void battery_monitor_task(void *pv) {
+    while(1) {
+        int adc_raw = adc1_get_raw(BATTERY_ADC_CH);
+        if (adc_raw < ADC_THRESHOLD_LOW) {
+            // Batería Baja: Enciende Rojo al 30%, Apaga Verde
+            set_led_state(CANAL_LED_VERDE, false);
+            set_led_state(CANAL_LED_ROJO, true);
+        } else {
+            // Batería OK: Enciende Verde al 30%, Apaga Rojo
+            set_led_state(CANAL_LED_VERDE, true);
+            set_led_state(CANAL_LED_ROJO, false);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+void i2s_init(void) {
+    i2s_config_t i2s_config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,     
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,     
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256, // Ajustado a 256 para mayor estabilidad con el DSP                                
+        .use_apll = false
+    };
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK_IO,
+        .ws_io_num = I2S_WS_IO,
+        .data_out_num = -1,
+        .data_in_num = I2S_DI_IO
+    };
+    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_PORT, &pin_config);
+    i2s_zero_dma_buffer(I2S_PORT);
+}
+
+// =======================================================================
+// FUNCIONES DSP (Procesamiento de Señal Digital)
+// =======================================================================
+
+// 1. Filtro de Mediana
+int16_t aplicar_filtro_mediana_5(int16_t nueva_muestra) {
+    static int16_t v[5] = {0};
+    int16_t temp[5];
+    for(int i = 4; i > 0; i--) v[i] = v[i-1];
+    v[0] = nueva_muestra;
+    for(int i = 0; i < 5; i++) temp[i] = v[i];
+    for(int i = 1; i < 5; i++) {
+        int16_t key = temp[i];
+        int j = i - 1;
+        while(j >= 0 && temp[j] > key) {
+            temp[j+1] = temp[j];
+            j--;
+        }
+        temp[j+1] = key;
+    }
+    return temp[2]; 
+}
+
+// 2. Slew Rate Limiter (Limita velocidad de cambio)
+int16_t aplicar_limitador_velocidad(int16_t nueva_muestra) {
+    static int16_t muestra_anterior = 0;
+    const int32_t MAX_DELTA = 1000; 
+    int32_t delta = (int32_t)nueva_muestra - (int32_t)muestra_anterior;
+    if (delta > MAX_DELTA) nueva_muestra = muestra_anterior + MAX_DELTA;
+    else if (delta < -MAX_DELTA) nueva_muestra = muestra_anterior - MAX_DELTA;
+    muestra_anterior = nueva_muestra;
+    return nueva_muestra;
+}
+
+// 3. Filtro Anti-aire y Anti-retumbo
+// ---------------------------------------------------------------------------
+// BANDA ENSANCHADA A 26-150 Hz PARA CAPTURA CARDIACA (2026-07-17).
+// El filtro anterior era un pasa-banda one-pole ~53-67 Hz que atenuaba la
+// propia banda del corazon 5-9 dB (medido sobre captura_cruda_4khz.wav):
+//   -9.1 dB @20Hz, -5.8 dB @100Hz, -7.9 dB @150Hz.
+// Ensancharlo a ~26-150 Hz recupera +4..+6 dB en toda la banda cardiaca y
+// preserva ~2x mas la banda alta (67-150 Hz: 39% -> 75%). Santi filtra
+// 20-150 Hz aguas abajo, asi que dejar entrar la banda cardiaca completa
+// aqui = mas senal sin mas ruido de banda. Ver Audio_Code/heart-firmware-changes.md.
+//
+// Para A/B rapido, valores ANTERIORES: LPF 0.10f/0.90f (fc~67Hz), HPF 0.92f (fc~53Hz).
+// =======================================================================
+// FILTRO BIQUAD EN CASCADA DE 4TO ORDEN
+// =======================================================================
+int16_t aplicar_filtro_anti_aire(int16_t muestra) {
+    float x = (float)muestra;
+
+    // 1. Aplicar Biquad Pasa Altas (Corta graves innecesarios)
+    float y_hpf = (HPF_B0 * x) + (HPF_B1 * hpf_x1) + (HPF_B2 * hpf_x2) 
+                  - (HPF_A1 * hpf_y1) - (HPF_A2 * hpf_y2);
+    hpf_x2 = hpf_x1;
+    hpf_x1 = x;
+    hpf_y2 = hpf_y1;
+    hpf_y1 = y_hpf;
+
+    // 2. Aplicar Biquad Pasa Bajas - Etapa 1 (Inicia el corte a 110 Hz)
+    float y_lpf1 = (LPF_B0 * y_hpf) + (LPF_B1 * lpf_x1) + (LPF_B2 * lpf_x2) 
+                  - (LPF_A1 * lpf_y1) - (LPF_A2 * lpf_y2);
+    lpf_x2 = lpf_x1;
+    lpf_x1 = y_hpf;
+    lpf_y2 = lpf_y1;
+    lpf_y1 = y_lpf1;
+
+    // 3. Aplicar Biquad Pasa Bajas - Etapa 2 (Duplica el nivel de bloqueo)
+    float y_lpf2 = (LPF_B0 * y_lpf1) + (LPF_B1 * lpf2_x1) + (LPF_B2 * lpf2_x2) 
+                  - (LPF_A1 * lpf2_y1) - (LPF_A2 * lpf2_y2);
+    lpf2_x2 = lpf2_x1;
+    lpf2_x1 = y_lpf1;
+    lpf2_y2 = lpf2_y1;
+    lpf2_y1 = y_lpf2;
+
+    // --- NUEVO: GANANCIA POST-FILTRO ---
+    // Multiplicamos la señal limpia para darle fuerza bruta al "lub-dub"
+    float ganancia = 4.5f; 
+    float latido_resaltado = y_lpf2 * ganancia;
+
+    // Retornar la muestra final con el latido masivamente amplificado
+    return (int16_t)latido_resaltado;
+}
+
+// 4. Soft Clipper
+int16_t aplicar_limitador_suave(int16_t muestra) {
+    if (muestra > 18000) return 18000 + ((muestra - 18000) / 2);
+    else if (muestra < -18000) return -18000 + ((muestra + 18000) / 2);
+    return muestra;
+}
+
+// =======================================================================
+// TAREA PRINCIPAL DE AUDIO Y BLE
+// =======================================================================
+void audio_stream_task(void *pv) {
+    uint8_t packet_buffer[244];
+    int16_t *audio_samples = (int16_t *)&packet_buffer[2]; 
+    
+    size_t bytes_read;
+    int sample_index = 0;
+    int32_t acumulador = 0; 
+    int contador_muestras = 0;
+
+    int muestras_ignoradas = 0;
+    const int MUESTRAS_A_IGNORAR = 6000; 
+
+    ESP_LOGI(TAG, "Streaming BLE iniciado. DSP Master Activo.");
+
+    while(1) {
+        esp_err_t ret = i2s_read(I2S_PORT, i2s_buffer, sizeof(i2s_buffer), &bytes_read, portMAX_DELAY);
+        
+        if (ret == ESP_OK && bytes_read > 0) {
+            int samples_read = bytes_read / sizeof(int32_t);
+            
+            for (int i = 0; i < samples_read; i++) {
+                int16_t clean_sample = (int16_t)(i2s_buffer[i] >> 12);
+
+                acumulador += clean_sample;
+                contador_muestras++;
+
+                // Decimación a 4kHz
+                if (contador_muestras >= DOWNSAMPLE_FACTOR) {
+                    int16_t muestra_4khz = (int16_t)(acumulador / DOWNSAMPLE_FACTOR);
+                    acumulador = 0;
+                    contador_muestras = 0;
+
+                    // Ignorar las primeras muestras para estabilizar el micro
+                    if (muestras_ignoradas < MUESTRAS_A_IGNORAR) {
+                        muestras_ignoradas++;
+                        continue;
+                    }
+
+                    // Warm-up por-grabacion: cuenta regresiva iniciada por START. Al
+                    // llegar a 0, enciende streaming y avisa a la app (isWarmingUp=0)
+                    // para que arranque sus 10s. No emitimos audio durante el warm-up.
+                    if (g_ready_countdown > 0) {
+                        g_ready_countdown--;
+                        if (g_ready_countdown == 0) {
+                            g_ready_countdown = -1;
+                            sample_index = 0;         // primer paquete limpio
+                            audio_seq_num = 0;
+                            g_streaming = true;
+                            device_status = 0x05;     // isConnected + isRecording
+                            update_status_bitfield();
+                            ESP_LOGI(TAG, "warm-up done -> streaming ON");
+                        }
+                    }
+
+                    // --- CADENA DE PROCESAMIENTO DIGITAL (DSP) ---
+                    int16_t st1 = aplicar_filtro_mediana_5(muestra_4khz);
+                    int16_t st2 = aplicar_limitador_velocidad(st1);
+                    int16_t st3 = aplicar_filtro_anti_aire(st2);
+                    int16_t final_sample = aplicar_limitador_suave(st3);
+
+                    audio_samples[sample_index] = final_sample;
+                    sample_index++;
+
+                    // Enviamos al completar un paquete del tamano acorde al MTU
+                    // (g_audio_bytes/2 muestras). El fijo de 121 rompia en iOS.
+                    if (sample_index >= (g_audio_bytes / 2)) {
+                        packet_buffer[0] = (uint8_t)((audio_seq_num >> 8) & 0xFF);
+                        packet_buffer[1] = (uint8_t)(audio_seq_num & 0xFF);
+
+                        if (conn_handle != 0xFFFF && g_streaming) {
+                            // Total = 2 (seq) + muestras*2; cabe en MTU-3 por construccion.
+                            struct os_mbuf *om = ble_hs_mbuf_from_flat(packet_buffer, 2 + sample_index * 2);
+                            if (om) {
+                                int rc = ble_gattc_notify_custom(conn_handle, audio_handle, om);
+                                if (rc == 0) audio_seq_num++;
+                            }
+                        }
+                        sample_index = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =======================================================================
+// CONFIGURACIÓN BLE (NimBLE)
+// =======================================================================
+void update_status_bitfield(void) {
+    // Notifica el device_status ACTUAL (ya no lo pisa con 0x05 fijo).
+    if (conn_handle != 0xFFFF) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(&device_status, 1);
+        if (om) ble_gattc_notify_custom(conn_handle, status_handle, om);
+    }
+}
+
+static int gatt_access_cb(uint16_t c_h, uint16_t a_h, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (a_h == devinfo_handle && ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        return os_mbuf_append(ctxt->om, devinfo_json, strlen(devinfo_json)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (a_h == command_handle && ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        if (ctxt->om->om_len > 0) {
+            uint8_t command;
+            os_mbuf_copydata(ctxt->om, 0, 1, &command);
+            ESP_LOGI(TAG, "Comando recibido: 0x%02X", command);
+            if (command == 0x01) {           // START_RECORDING
+                audio_seq_num = 0;
+                // Warm-up ~0.5s (2000 muestras @4kHz): NO emitimos audio todavia y
+                // dejamos device_status en isWarmingUp=1. El audio-task, al agotar la
+                // cuenta, enciende streaming y notifica isWarmingUp=0 -> la app ve la
+                // transicion y arranca sus 10s exactos. El retardo evita la carrera
+                // con el set optimista isWarmingUp=true de la app.
+                g_streaming = false;
+                g_ready_countdown = 2000;
+                device_status = 0x03;         // isConnected + isWarmingUp
+                ESP_LOGI(TAG, "START -> warm-up (%d muestras)", (int)g_ready_countdown);
+            } else if (command == 0x02) {     // STOP_RECORDING
+                g_streaming = false;
+                g_ready_countdown = -1;
+                device_status = 0x01;         // isConnected (isRecording=0)
+                update_status_bitfield();
+                ESP_LOGI(TAG, "STOP -> streaming OFF");
+            } else if (command == 0xFF) {     // RESET
+                esp_restart();
+            }
+        }
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = (ble_uuid_t *)&SVC_UUID_AA00_16, 
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {.uuid = &CHR_UUID_AUDIO.u, .val_handle = &audio_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_NOTIFY},
+            {.uuid = &CHR_UUID_DEVINFO.u, .val_handle = &devinfo_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_READ},
+            {.uuid = &CHR_UUID_COMMAND.u, .val_handle = &command_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_WRITE},
+            {.uuid = &CHR_UUID_STATUS.u, .val_handle = &status_handle, .access_cb = gatt_access_cb, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY},
+            {0} 
+        }
+    },
+    {0} 
+};
+
+static void start_advertising(void) {
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)device_name;
+    fields.name_len = strlen(device_name);
+    fields.name_is_complete = 1;
+    fields.uuids16 = (ble_uuid16_t[]){ SVC_UUID_AA00_16 };
+    fields.num_uuids16 = 1;
+    fields.uuids16_is_complete = 1;
+
+    ble_gap_adv_set_fields(&fields);
+    struct ble_gap_adv_params adv_p = { .conn_mode = BLE_GAP_CONN_MODE_UND, .disc_mode = BLE_GAP_DISC_MODE_GEN };
+    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_p, gap_event_handler, NULL);
+    ESP_LOGI(TAG, "Publicidad lista: %s", device_name);
+    
+    gpio_set_level(LED_AZUL_PIN, 0); 
+    set_led_state(CANAL_LED_AZUL, true);
+
+    // Mandamos el brillo al 100% (255) solo para probar si el azul está vivo
+    //ledc_set_duty(LEDC_MODE, CANAL_LED_AZUL, 255); 
+    //ledc_update_duty(LEDC_MODE, CANAL_LED_AZUL);
+}
+
+// Recalcula el tamano de payload de audio segun el MTU negociado de la conexion.
+// ble_att_mtu() devuelve 23 si el cliente aun no negocio (APK viejo) -> el
+// calculo lo maneja solo. Universal para iOS (~185) y Android (247).
+static void update_audio_mtu(uint16_t conn) {
+    uint16_t mtu = ble_att_mtu(conn);
+    if (mtu < 23) mtu = 23;
+    int32_t ab = (int32_t)mtu - 3 - 2;   // header ATT + 2 bytes de seq
+    ab &= ~1;                            // par: muestras completas de 16 bits
+    if (ab > 242) ab = 242;              // tope = comportamiento actual (121 muestras)
+    if (ab < 2)   ab = 2;
+    g_audio_bytes = (uint16_t)ab;
+    ESP_LOGI(TAG, "MTU=%u -> audio payload=%u bytes (%u muestras)", mtu, g_audio_bytes, g_audio_bytes / 2);
+}
+
+static int gap_event_handler(struct ble_gap_event *event, void *arg) {
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                conn_handle = event->connect.conn_handle;
+                update_audio_mtu(conn_handle); // tamano inicial seguro; el evento MTU lo ajusta
+                ESP_LOGI(TAG, "¡Conectado!");
+                
+                // AQUÍ: Cambiamos a true para que se quede encendido al conectarse
+                set_led_state(CANAL_LED_AZUL, false); // Apagamos el azul al conectarse 
+                // Mantenemos el azul encendido a tope para confirmarlo
+                //ledc_set_duty(LEDC_MODE, CANAL_LED_AZUL, 255); 
+                //ledc_update_duty(LEDC_MODE, CANAL_LED_AZUL);
+                
+                audio_seq_num = 0;
+                g_streaming = false;
+                g_ready_countdown = -1;
+                device_status = 0x01;   // isConnected (NO isRecording -> no "graba sola")
+                update_status_bitfield();
+            } else {
+                start_advertising();
+            }
+            break;
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            update_status_bitfield();
+            break;
+        case BLE_GAP_EVENT_MTU:
+            update_audio_mtu(event->mtu.conn_handle);
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            conn_handle = 0xFFFF;
+            g_streaming = false;
+            g_ready_countdown = -1;
+            device_status = 0x00;
+            start_advertising();
+            break;
+    }
+    return 0;
+}
+
+void on_stack_sync(void) {
+    ble_att_set_preferred_mtu(247); // mantiene 247 con Android moderno
+    ble_hs_id_infer_auto(0, &(uint8_t){0});
+    ble_svc_gap_device_name_set(device_name);
+    start_advertising();
+}
+
+void nimble_host_task(void *param) { 
+    nimble_port_run();
+}
+
+void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
+    init_hardware_monitors();
+    
+    xTaskCreatePinnedToCore(battery_monitor_task, "battery_monitor_task", 4096, NULL, 4, NULL, 0);
+
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA); 
+    snprintf(device_name, sizeof(device_name), "APPMEDIC-%02X%02X", mac[4], mac[5]); 
+
+    i2s_init();
+
+    snprintf(devinfo_json, sizeof(devinfo_json),
+             "{\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\",\"name\":\"%s\",\"model\":\"STETH-V1\",\"firmware\":\"1.0.0\"}",
+             device_name);
+
+    nimble_port_init();
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_gatts_count_cfg(gatt_svcs);
+    ble_gatts_add_svcs(gatt_svcs);
+
+    ble_hs_cfg.sync_cb = on_stack_sync;
+
+    xTaskCreatePinnedToCore(audio_stream_task, "audio_stream_task", 8192, NULL, 8, NULL, 0);
+    
+    nimble_port_freertos_init(nimble_host_task);
+}
